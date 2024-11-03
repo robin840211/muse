@@ -413,91 +413,113 @@ export default class {
   }
 
   private async getStream(song: QueuedSong, options: {seek?: number; to?: number} = {}): Promise<Readable> {
-    if (song.source === MediaSource.HLS) {
-      return this.createReadStream({url: song.url, cacheKey: song.url});
-    }
-
-    let ffmpegInput: string | null;
-    const ffmpegInputOptions: string[] = [];
-    let shouldCacheVideo = false;
-
-    let format: YTDLVideoFormat | undefined;
-
-    ffmpegInput = await this.fileCache.getPathFor(this.getHashForCache(song.url));
-
-    if (!ffmpegInput) {
-      // Not yet cached, must download
-      const info = await ytdl.getInfo(song.url);
-
-      const formats = info.formats as YTDLVideoFormat[];
-
-      const filter = (format: ytdl.videoFormat): boolean => format.codecs === 'opus' && format.container === 'webm' && format.audioSampleRate !== undefined && parseInt(format.audioSampleRate, 10) === 48000;
-
-      format = formats.find(filter);
-
-      const nextBestFormat = (formats: ytdl.videoFormat[]): ytdl.videoFormat | undefined => {
-        if (formats[0].isLive) {
-          formats = formats.sort((a, b) => (b as unknown as {audioBitrate: number}).audioBitrate - (a as unknown as {audioBitrate: number}).audioBitrate); // Bad typings
-
-          return formats.find(format => [128, 127, 120, 96, 95, 94, 93].includes(parseInt(format.itag as unknown as string, 10))); // Bad typings
+    const maxRetries = 1; // maximum retries (for at most 2 times)
+    let lastError: Error | null = null;
+	
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+	    if (song.source === MediaSource.HLS) {
+          return this.createReadStream({url: song.url, cacheKey: song.url});
         }
 
-        formats = formats
-          .filter(format => format.averageBitrate)
-          .sort((a, b) => {
-            if (a && b) {
-              return b.averageBitrate! - a.averageBitrate!;
+        let ffmpegInput: string | null;
+        const ffmpegInputOptions: string[] = [];
+        let shouldCacheVideo = false;
+
+        let format: YTDLVideoFormat | undefined;
+
+        ffmpegInput = await this.fileCache.getPathFor(this.getHashForCache(song.url));
+
+        if (!ffmpegInput) {
+          // Not yet cached, must download
+          const info = await ytdl.getInfo(song.url);
+
+          const formats = info.formats as YTDLVideoFormat[];
+
+          const filter = (format: ytdl.videoFormat): boolean => format.codecs === 'opus' && format.container === 'webm' && format.audioSampleRate !== undefined && parseInt(format.audioSampleRate, 10) === 48000;
+
+          format = formats.find(filter);
+
+          const nextBestFormat = (formats: ytdl.videoFormat[]): ytdl.videoFormat | undefined => {
+            if (formats[0].isLive) {
+              formats = formats.sort((a, b) => (b as unknown as {audioBitrate: number}).audioBitrate - (a as unknown as {audioBitrate: number}).audioBitrate); // Bad typings
+
+              return formats.find(format => [128, 127, 120, 96, 95, 94, 93].includes(parseInt(format.itag as unknown as string, 10))); // Bad typings
             }
 
-            return 0;
-          });
-        return formats.find(format => !format.bitrate) ?? formats[0];
-      };
+            formats = formats
+              .filter(format => format.averageBitrate)
+              .sort((a, b) => {
+                if (a && b) {
+                  return b.averageBitrate! - a.averageBitrate!;
+                }
 
-      if (!format) {
-        format = nextBestFormat(info.formats);
+                return 0;
+              });
+            return formats.find(format => !format.bitrate) ?? formats[0];
+          };
 
-        if (!format) {
-          // If still no format is found, throw
-          throw new Error('Can\'t find suitable format.');
+          if (!format) {
+            format = nextBestFormat(info.formats);
+
+            if (!format) {
+              // If still no format is found, throw
+              throw new Error('Can\'t find suitable format.');
+            }
+          }
+
+          debug('Using format', format);
+
+          ffmpegInput = format.url;
+
+          // Don't cache livestreams or long videos
+          const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
+          shouldCacheVideo = !info.player_response.videoDetails.isLiveContent && parseInt(info.videoDetails.lengthSeconds, 10) < MAX_CACHE_LENGTH_SECONDS && !options.seek;
+
+          debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
+
+          ffmpegInputOptions.push(...[
+            '-reconnect',
+            '1',
+            '-reconnect_streamed',
+            '1',
+            '-reconnect_delay_max',
+            '5',
+          ]);
         }
+
+        if (options.seek) {
+          ffmpegInputOptions.push('-ss', options.seek.toString());
+        }
+
+        if (options.to) {
+          ffmpegInputOptions.push('-to', options.to.toString());
+        }
+
+        return this.createReadStream({
+          url: ffmpegInput,
+          cacheKey: song.url,
+          ffmpegInputOptions,
+          cache: shouldCacheVideo,
+          volumeAdjustment: format?.loudnessDb ? `${-format.loudnessDb}dB` : undefined,
+        });
+      } catch (error: unknown) {
+        lastError = error as Error;
+        // console.error(`Attempt ${attempt + 1}/${maxRetries + 1} failed for URL: ${song.url}`);
+      
+        if (attempt < maxRetries) {
+          // wait a peroid to retry
+          await new Promise(resolve => setTimeout(resolve, 500));
+          continue;
+        }
+      
+        // if failed after 3 tries, throw exception there
+        console.error(`Failed to play song: ${song.url}`);
+        throw lastError;
       }
+	}
 
-      debug('Using format', format);
-
-      ffmpegInput = format.url;
-
-      // Don't cache livestreams or long videos
-      const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
-      shouldCacheVideo = !info.player_response.videoDetails.isLiveContent && parseInt(info.videoDetails.lengthSeconds, 10) < MAX_CACHE_LENGTH_SECONDS && !options.seek;
-
-      debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
-
-      ffmpegInputOptions.push(...[
-        '-reconnect',
-        '1',
-        '-reconnect_streamed',
-        '1',
-        '-reconnect_delay_max',
-        '5',
-      ]);
-    }
-
-    if (options.seek) {
-      ffmpegInputOptions.push('-ss', options.seek.toString());
-    }
-
-    if (options.to) {
-      ffmpegInputOptions.push('-to', options.to.toString());
-    }
-
-    return this.createReadStream({
-      url: ffmpegInput,
-      cacheKey: song.url,
-      ffmpegInputOptions,
-      cache: shouldCacheVideo,
-      volumeAdjustment: format?.loudnessDb ? `${-format.loudnessDb}dB` : undefined,
-    });
+    throw lastError; // should not excuted, but must have for TypeScript code checking
   }
 
   private startTrackingPosition(initalPosition?: number): void {
@@ -549,9 +571,11 @@ export default class {
       return;
     }
 
+    let currentSong = null;
     // Automatically re-add current song to queue
     if (this.loopCurrentQueue && newState.status === AudioPlayerStatus.Idle && this.status === STATUS.PLAYING) {
-      const currentSong = this.getCurrent();
+      // const currentSong = this.getCurrent();
+      currentSong = this.getCurrent();
 
       if (currentSong) {
         this.add(currentSong);
@@ -561,14 +585,26 @@ export default class {
     }
 
     if (newState.status === AudioPlayerStatus.Idle && this.status === STATUS.PLAYING) {
-      await this.forward(1);
-      // Auto announce the next song if configured to
-      const settings = await getGuildSettings(this.guildId);
-      const {autoAnnounceNextSong} = settings;
-      if (autoAnnounceNextSong && this.currentChannel) {
-        await this.currentChannel.send({
-          embeds: this.getCurrent() ? [buildPlayingMessageEmbed(this)] : [],
-        });
+      try {
+        await this.forward(1);
+        // Auto announce the next song if configured to
+        const settings = await getGuildSettings(this.guildId);
+        const {autoAnnounceNextSong} = settings;
+        if (autoAnnounceNextSong && this.currentChannel) {
+          await this.currentChannel.send({
+            embeds: this.getCurrent() ? [buildPlayingMessageEmbed(this)] : [],
+          });
+        }
+      } catch (error) {
+        if (currentSong) {
+          console.error(`${currentSong.title} is unavailable`);
+        }
+		debug(`Error during song transition: ${error}`);
+        // try playing next song
+        this.removeCurrent();
+        if (this.getCurrent()) {
+          await this.play().catch(console.error);
+		}
       }
     }
   }
